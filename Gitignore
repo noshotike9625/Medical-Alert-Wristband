@@ -1,0 +1,21 @@
+# Secret credentials — never commit this
+secrets.h
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Arduino build artifacts
+build/
+*.elf
+*.hex
+*.bin
+
+# VS Code
+.vscode/
+
+# Compiled Python (if any scripts)
+__pycache__/
+*.pyc
