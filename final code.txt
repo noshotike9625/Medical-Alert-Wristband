@@ -1,0 +1,266 @@
+#include <WiFiNINA.h>
+#include <Wire.h>
+#include "RTClib.h"
+
+RTC_DS3231 rtc;
+WiFiSSLClient client;
+
+// -------------------- CONFIG --------------------
+// PHASE 1: Set this to true, upload once to set RTC,
+// verify time in Serial Monitor, then change
+// to false and upload again for normal use.
+const bool SET_RTC_MODE = true;
+
+// -------------------- WIFI ----------------------
+const char WIFI_SSID[] = "Business WIFI";
+const char WIFI_PASS[] = "I have a password";
+
+// -------------------- IFTTT ---------------------
+const char IFTTT_HOST[] = "maker.ifttt.com";
+const int IFTTT_PORT = 443;
+const char IFTTT_EVENT_NAME[] = "dose_missed";
+const char IFTTT_KEY[] = "byEGW7l45pBSi2Uz-IzoyRLZW8JCtITKNr0o_nA6ROE";
+
+// -------------------- ALARM SETTINGS -----------
+const int ALARM_HOUR = 13; // 13 = 1 PM
+const int ALARM_MINUTE = 0; // 13:00 exactly
+const unsigned long RESPONSE_WINDOW_MS = 5000UL; // 5 seconds
+
+// -------------------- VIBRATION PATTERN --------
+// Adjust these for different pulse feel:
+const unsigned long BUZZ_ON_MS = 200; // motor ON time (ms)
+const unsigned long BUZZ_OFF_MS = 150; // motor OFF time (ms)
+
+// -------------------- PINS ---------------------
+const int BUTTON_PIN = 2; // button to GND, use INPUT_PULLUP
+const int MOTOR_PIN = 5; // transistor base through 1k resistor
+
+// -------------------- STATE --------------------
+bool reminderActive = false;
+bool doseTakenToday = false;
+bool missedDoseSentToday = false;
+unsigned long reminderStartMillis = 0;
+int lastDayChecked = -1;
+
+// For pulsing pattern
+unsigned long lastBuzzToggle = 0;
+bool motorOnPhase = false;
+
+// -------------------- WIFI ---------------------
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  int status = WL_IDLE_STATUS;
+  while (status != WL_CONNECTED) {
+    status = WiFi.begin(WIFI_SSID, WIFI_PASS);
+    delay(5000);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// -------------------- IFTTT --------------------
+bool sendIFTTTNotification() {
+  Serial.println("Sending IFTTT notification...");
+
+  String url = "/trigger/";
+  url += IFTTT_EVENT_NAME;
+  url += "/with/key/";
+  url += IFTTT_KEY;
+
+  if (!client.connect(IFTTT_HOST, IFTTT_PORT)) {
+    Serial.println("Connection to IFTTT failed.");
+    return false;
+  }
+
+  String body = "{"value1":"Dose not taken","value2":"Medication reminder missed","value3":"Sent from MKR WiFi 1010"}";
+
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: maker.ifttt.com");
+  client.println("User-Agent: ArduinoMKRWiFi1010");
+  client.println("Connection: close");
+  client.println("Content-Type: application/json");
+  client.print("Content-Length: ");
+  client.println(body.length());
+  client.println();
+  client.println(body);
+
+  unsigned long timeout = millis();
+  while (client.connected() && millis() - timeout < 5000) {
+    while (client.available()) {
+      char c = client.read();
+      Serial.write(c);
+      timeout = millis();
+    }
+  }
+
+  client.stop();
+  Serial.println();
+  Serial.println("IFTTT notification request finished.");
+  return true;
+}
+
+// -------------------- SETUP --------------------
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(MOTOR_PIN, LOW);
+
+  Serial.begin(115200);
+  while (!Serial) { ; } // wait for Serial on native USB boards
+
+  Wire.begin();
+
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC.");
+    while (1);
+  }
+
+  if (SET_RTC_MODE) {
+    // --------- PHASE 1: FORCE-SET RTC TO COMPILE TIME ----------
+    Serial.println("SET_RTC_MODE = true");
+    Serial.println("Setting RTC to compile date/time...");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  } else {
+    // --------- PHASE 2: NORMAL MODE ----------
+    // Only set RTC if it actually lost power.
+    if (rtc.lostPower()) {
+      Serial.println("RTC lost power. Setting RTC to compile time...");
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    } else {
+      Serial.println("RTC already running, keeping stored time.");
+    }
+  }
+
+  // Optional: print the current RTC time at startup
+  DateTime now = rtc.now();
+  Serial.print("RTC time at startup: ");
+  Serial.print(now.year());
+  Serial.print('/');
+  Serial.print(now.month());
+  Serial.print('/');
+  Serial.print(now.day());
+  Serial.print(' ');
+  if (now.hour() < 10) Serial.print('0');
+  Serial.print(now.hour());
+  Serial.print(':');
+  if (now.minute() < 10) Serial.print('0');
+  Serial.print(now.minute());
+  Serial.print(':');
+  if (now.second() < 10) Serial.print('0');
+  Serial.println(now.second());
+
+  connectToWiFi();
+}
+
+// -------------------- LOOP ---------------------
+void loop() {
+  DateTime now = rtc.now();
+
+  // Print time once per second for debugging
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+
+    Serial.print(now.year());
+    Serial.print('/');
+    Serial.print(now.month());
+    Serial.print('/');
+    Serial.print(now.day());
+    Serial.print(' ');
+    if (now.hour() < 10) Serial.print('0');
+    Serial.print(now.hour());
+    Serial.print(':');
+    if (now.minute() < 10) Serial.print('0');
+    Serial.print(now.minute());
+    Serial.print(':');
+    if (now.second() < 10) Serial.print('0');
+    Serial.println(now.second());
+  }
+
+  // New-day reset (resets daily flags once per calendar day)
+  if (now.day() != lastDayChecked) {
+    lastDayChecked = now.day();
+    reminderActive = false;
+    doseTakenToday = false;
+    missedDoseSentToday = false;
+    digitalWrite(MOTOR_PIN, LOW);
+    motorOnPhase = false;
+    Serial.println("New day detected. Daily states reset.");
+  }
+
+  // Start reminder at ALARM_HOUR:ALARM_MINUTE (once per day)
+  if (!doseTakenToday &&
+      !reminderActive &&
+      now.hour() == ALARM_HOUR &&
+      now.minute() == ALARM_MINUTE &&
+      now.second() < 3) {
+    reminderActive = true;
+    reminderStartMillis = millis();
+    lastBuzzToggle = millis();
+    motorOnPhase = true;
+    digitalWrite(MOTOR_PIN, HIGH); // start with motor ON
+    Serial.println("Reminder started. Motor pulsing.");
+  }
+
+  // Handle reminder active state
+  if (reminderActive) {
+    unsigned long nowMs = millis();
+    unsigned long patternElapsed = nowMs - reminderStartMillis;
+
+    // --- Motor pulsing pattern during response window ---
+    if (patternElapsed < RESPONSE_WINDOW_MS) {
+      unsigned long phaseElapsed = nowMs - lastBuzzToggle;
+
+      if (motorOnPhase && phaseElapsed >= BUZZ_ON_MS) {
+        motorOnPhase = false;
+        lastBuzzToggle = nowMs;
+        digitalWrite(MOTOR_PIN, LOW);
+      } else if (!motorOnPhase && phaseElapsed >= BUZZ_OFF_MS) {
+        motorOnPhase = true;
+        lastBuzzToggle = nowMs;
+        digitalWrite(MOTOR_PIN, HIGH);
+      }
+    } else {
+      // After response window, make sure motor is off
+      motorOnPhase = false;
+      digitalWrite(MOTOR_PIN, LOW);
+    }
+
+    // --- Button handling and missed-dose logic ---
+    bool buttonPressed = (digitalRead(BUTTON_PIN) == LOW);
+
+    if (buttonPressed) {
+      digitalWrite(MOTOR_PIN, LOW);
+      reminderActive = false;
+      motorOnPhase = false;
+      doseTakenToday = true;
+      Serial.println("Button pressed. Dose acknowledged. Motor OFF.");
+      delay(300); // simple debounce
+    } else {
+      // Check for timeout -> missed dose
+      if ((nowMs - reminderStartMillis >= RESPONSE_WINDOW_MS) && !missedDoseSentToday) {
+        digitalWrite(MOTOR_PIN, LOW);
+        reminderActive = false;
+        motorOnPhase = false;
+        missedDoseSentToday = true;
+
+        if (WiFi.status() != WL_CONNECTED) {
+          connectToWiFi();
+        }
+
+        bool success = sendIFTTTNotification();
+        if (success) {
+          Serial.println("Missed-dose notification sent.");
+        } else {
+          Serial.println("Missed-dose notification failed.");
+        }
+      }
+    }
+  }
+}
